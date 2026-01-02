@@ -1,0 +1,523 @@
+# Rainfall Forecasting (30-Day Rolling Mean) — LSTM Ensemble + Hybrid Residual XGBoost
+
+## Overview
+This project forecasts **30-day rolling mean rainfall** using meteorological time series data.
+The main approach is a **Pyramid LSTM** trained on 120-day lookback sequences, extended into a **Hybrid Residual model**:
+**LSTM Ensemble prediction + XGBoost residual correction**, with peak-weighted training to better capture extreme rainfall.
+
+## Target
+- `RR_30d_mean = rolling_mean(RR, window=30)`
+
+## Features
+- Meteorology: TN, TX, TAVG, RH_AVG, SS, FF_X, FF_AVG
+- Seasonal encoding: month_sin, month_cos
+- Rain memory: RR lag (7,14,21,28,30,60,90)
+- Rolling rainfall (shifted to avoid leakage): RR_roll7/14/30_mean_s1
+- Wind direction cyclic: DDD_X_sin/cos, DDD_CAR_sin/cos
+
+## Data Split
+Chronological split (no shuffle):
+- Train 70%
+- Validation 15%
+- Test 15%
+
+## Sequence Setup
+- Lookback window = 120 days
+- Shape: (samples, 120, num_features)
+
+## Model 1: Pyramid LSTM + Weighted Loss
+Architecture:
+- LSTM(64, return_sequences=True) → Dropout(0.05)
+- LSTM(32) → Dropout(0.05)
+- Dense(16, ReLU) → Dense(1)
+
+Loss:
+- Weighted Huber Loss (k=6.0, delta=0.02) to emphasize peak rainfall.
+
+## Ensemble
+Train multiple models with different seeds and average predictions:
+- seeds: [7, 42, 202]
+
+## Model 2: Hybrid Residual (LSTM + XGBoost)
+Steps:
+1. Train LSTM ensemble → `yhat_lstm`
+2. Compute residual: `residual = y_true - yhat_lstm`
+3. Train XGBoost to predict residual using tabular features (aligned with lookback)
+4. Final prediction: `yhat_final = yhat_lstm + residual_hat`
+
+Peak weighting:
+- Extra weight applied to samples above P90 rainfall threshold.
+
+## Results (Test)
+- LSTM Ensemble: R² = 0.9522
+- Hybrid Residual: R² = 0.9652
+- Peak-only (test > P90 train):
+  - LSTM: R² = 0.4183
+  - Hybrid: R² = 0.6198
+
+## How to Run
+1. Install dependencies:
+   - tensorflow, numpy, pandas, scikit-learn, xgboost
+2. Update `CSV_PATH` in the script
+3. Run the training script / notebook
+
+## Notes
+- Rolling features use shift(1) to prevent leakage.
+- Hybrid residual improves peak prediction stability.
+Kalau kamu mau, aku bisa rapihin README versi final sesuai repo kamu (misalnya: tambahin badge, struktur folder, contoh perintah pip install -r requirements.txt, dan contoh output metrics). Kamu tinggal kasih tahu nama repo + mau format bahasa Indonesia atau Inggris.
+
+
+
+
+
+
+
+Anda bilang:
+saya mau penjelasan README.MD nya lengkap dan detail dan berbahasa indonesia
+
+
+ChatGPT bilang:
+Berikut versi README.md lengkap + detail (Bahasa Indonesia) yang bisa langsung kamu copy–paste ke repo GitHub kamu. Aku buat dengan gaya dokumentasi yang rapi, ada penjelasan konsep, alur pipeline, arsitektur model, anti-leakage, evaluasi, sampai cara menjalankan.
+
+Catatan: aku pakai istilah “curah hujan” = RR, dan target = RR_30d_mean sesuai kode kamu.
+
+markdown
+Salin kode
+# Prediksi Curah Hujan (Rata-rata 30 Hari) dengan LSTM Ensemble & Hybrid Residual XGBoost
+
+Proyek ini membangun model *time series forecasting* untuk memprediksi **rata-rata curah hujan 30 hari (30-day rolling mean)** menggunakan data meteorologi harian.  
+Model utama menggunakan **Pyramid LSTM** dengan jendela historis (**lookback**) sepanjang **120 hari**, ditambah strategi **weighted loss** agar model lebih “mengejar puncak (peak)”.  
+Pengembangan lanjutan menggunakan pendekatan **Hybrid Residual**: **LSTM Ensemble** sebagai prediktor utama, lalu **XGBoost** memodelkan *residual* (selisih prediksi) untuk meningkatkan akurasi—terutama pada kondisi ekstrem.
+
+---
+
+## Daftar Isi
+- [Latar Belakang](#latar-belakang)
+- [Tujuan](#tujuan)
+- [Dataset](#dataset)
+- [Target/Label](#targetlabel)
+- [Fitur yang Digunakan](#fitur-yang-digunakan)
+- [Pembagian Data (Chronological Split)](#pembagian-data-chronological-split)
+- [Pembuatan Data Sekuens (Lookback 120)](#pembuatan-data-sekuens-lookback-120)
+- [Model 1: Pyramid LSTM + Weighted Loss](#model-1-pyramid-lstm--weighted-loss)
+  - [Arsitektur Model](#arsitektur-model)
+  - [Weighted Loss untuk Mengejar Peak](#weighted-loss-untuk-mengejar-peak)
+  - [Callback Training](#callback-training)
+  - [Ensemble](#ensemble)
+- [Model 2: Hybrid Residual (LSTM Ensemble + XGBoost)](#model-2-hybrid-residual-lstm-ensemble--xgboost)
+  - [Ide Utama](#ide-utama)
+  - [Alignment (Penting!)](#alignment-penting)
+  - [Peak Weighting untuk Residual](#peak-weighting-untuk-residual)
+- [Metrik Evaluasi](#metrik-evaluasi)
+- [Hasil Eksperimen](#hasil-eksperimen)
+- [Cara Menjalankan](#cara-menjalankan)
+- [Struktur File yang Disarankan](#struktur-file-yang-disarankan)
+- [Konfigurasi / Hyperparameter](#konfigurasi--hyperparameter)
+- [Catatan Penting](#catatan-penting)
+- [Lisensi](#lisensi)
+
+---
+
+## Latar Belakang
+Curah hujan memiliki pola musiman dan ketergantungan terhadap kondisi meteorologi sebelumnya. Selain itu, data curah hujan sering bersifat *noisy* (naik-turun tajam).  
+Agar prediksi lebih stabil dan relevan untuk analisis tren, proyek ini memprediksi **rata-rata curah hujan 30 hari** (bukan hujan harian langsung).  
+Tantangan utama: model sering “terlalu halus” (*too smooth*) sehingga **puncak hujan** tidak terprediksi dengan baik. Karena itu ditambahkan:
+1. **Weighted loss** (membuat error saat target besar menjadi lebih mahal)
+2. **Ensemble** (menstabilkan prediksi)
+3. **Hybrid residual** (koreksi error menggunakan XGBoost)
+
+---
+
+## Tujuan
+1. Memprediksi **RR_30d_mean** (rata-rata hujan 30 hari) dengan input fitur meteorologi dan histori hujan.
+2. Meningkatkan performa pada:
+   - akurasi keseluruhan (MAE/RMSE/R²)
+   - **kondisi ekstrem / peak** (bagian atas distribusi hujan)
+
+---
+
+## Dataset
+Dataset berupa file `.csv` dengan kolom minimal:
+- `TANGGAL` : tanggal pengamatan
+- `RR` : curah hujan (rainfall)
+- Fitur meteorologi: `TN`, `TX`, `TAVG`, `RH_AVG`, `SS`, `FF_X`, `DDD_X`, `FF_AVG`, `DDD_CAR`, dll.
+
+Di kode, file dibaca dengan:
+```python
+CSV_PATH = "/content/pekanbaru_clean_final.csv"
+Target/Label
+Target yang diprediksi adalah:
+
+RR_30d_mean = rolling mean 30 hari dari RR
+
+Kenapa rolling mean 30 hari?
+
+Mengurangi noise harian
+
+Lebih representatif untuk tren jangka pendek-menengah
+
+Cocok untuk melihat perubahan musiman / kecenderungan
+
+Implementasi:
+
+python
+Salin kode
+df["RR_30d_mean"] = df["RR"].rolling(30).mean()
+Fitur yang Digunakan
+1) Fitur Meteorologi Dasar
+Contoh fitur yang digunakan:
+
+TN, TX, TAVG : temperatur minimum/maksimum/rata-rata
+
+RH_AVG : kelembapan rata-rata
+
+SS : durasi penyinaran matahari
+
+FF_X, FF_AVG : kecepatan angin maksimum/rata-rata
+
+DDD_X, DDD_CAR : arah angin
+
+2) Seasonal Encoding (Bulan sebagai Siklik)
+Bulan (1–12) bersifat siklik (Januari dekat dengan Desember), sehingga diencode menjadi sinus & cosinus:
+
+python
+Salin kode
+df["month"] = df["TANGGAL"].dt.month
+df["month_sin"] = np.sin(2*np.pi*df["month"]/12)
+df["month_cos"] = np.cos(2*np.pi*df["month"]/12)
+3) Rain Memory Effect (Lag Curah Hujan)
+Curah hujan hari ini sering dipengaruhi kondisi beberapa hari/minggu sebelumnya.
+Fitur lag yang digunakan:
+
+Versi awal: RR_lag30, RR_lag60, RR_lag90
+
+Versi lanjutan: RR_lag7, RR_lag14, RR_lag21, RR_lag28, plus lag panjang
+
+Contoh:
+
+python
+Salin kode
+df["RR_lag30"] = df["RR"].shift(30)
+4) Rolling Rain Features (Anti-Leakage)
+Rolling mean dibuat dari RR.shift(1) untuk mencegah data leakage (fitur tidak boleh melihat RR hari yang sama saat memprediksi label hari itu).
+
+python
+Salin kode
+rr_shift1 = df["RR"].shift(1)
+df["RR_roll7_mean_s1"]  = rr_shift1.rolling(7).mean()
+df["RR_roll14_mean_s1"] = rr_shift1.rolling(14).mean()
+df["RR_roll30_mean_s1"] = rr_shift1.rolling(30).mean()
+5) Wind Direction Cyclic Encoding (Arah Angin)
+Arah angin 0–360 derajat juga siklik, sehingga diubah ke sin/cos:
+
+python
+Salin kode
+rad = 2*np.pi*df[col]/360.0
+df[f"{col}_sin"] = np.sin(rad)
+df[f"{col}_cos"] = np.cos(rad)
+Pembagian Data (Chronological Split)
+Karena ini time series, data dibagi berdasarkan urutan waktu (tanpa shuffle):
+
+Train: 70%
+
+Validation: 15%
+
+Test: 15%
+
+python
+Salin kode
+train_end = int(n * 0.70)
+val_end   = int(n * 0.85)
+Ini membuat evaluasi lebih realistis karena test adalah “masa depan” relatif terhadap train.
+
+Pembuatan Data Sekuens (Lookback 120)
+Model LSTM membutuhkan input berbentuk sekuens.
+Dengan LOOKBACK = 120, artinya untuk memprediksi target pada hari t, model menggunakan data fitur dari hari t-120 sampai t-1.
+
+Fungsi pembuat sekuens:
+
+python
+Salin kode
+def make_sequences(X, y, lookback):
+    Xs, ys = [], []
+    for i in range(lookback, len(X)):
+        Xs.append(X[i-lookback:i])
+        ys.append(y[i])
+    return np.array(Xs), np.array(ys)
+Contoh output shape:
+
+Train: (3843, 120, 14)
+
+Val: (729, 120, 14)
+
+Test: (730, 120, 14)
+
+Format:
+(jumlah_sample, panjang_window, jumlah_fitur)
+
+Model 1: Pyramid LSTM + Weighted Loss
+Arsitektur Model
+Model LSTM berbentuk “piramida” (64 → 32) agar layer awal menangkap pola kaya, layer berikutnya merangkum informasi.
+
+text
+Salin kode
+Input (120 hari x N fitur)
+→ LSTM 64 (return_sequences=True)
+→ Dropout
+→ LSTM 32
+→ Dropout
+→ Dense 16 (ReLU)
+→ Dense 1 (prediksi RR_30d_mean)
+Implementasi:
+
+python
+Salin kode
+layers.LSTM(64, return_sequences=True),
+layers.Dropout(DROPOUT),
+layers.LSTM(32),
+layers.Dropout(DROPOUT),
+layers.Dense(16, activation="relu"),
+layers.Dense(1)
+Weighted Loss untuk Mengejar Peak
+Masalah umum: model cenderung “menghaluskan” prediksi sehingga peak tidak terkejar.
+Solusi: memberi bobot lebih besar saat y_true besar.
+
+Bobot:
+
+w = 1 + k * y_true
+
+Mode loss:
+
+weighted_mse
+
+weighted_huber (dipakai di eksperimen kamu)
+
+Weighted Huber menggabungkan stabilitas Huber (tahan outlier) + penekanan pada target besar.
+
+Parameter penting:
+
+WEIGHT_K = 6.0
+
+HUBER_DELTA = 0.02
+
+Callback Training
+Untuk mencegah overfitting dan mengatur learning rate:
+
+EarlyStopping (patience 15, restore best weights)
+
+ReduceLROnPlateau (factor 0.5, patience 6)
+
+Ensemble
+Untuk mengurangi variansi model dan membuat prediksi lebih stabil, dilakukan ensemble dengan seed berbeda:
+
+python
+Salin kode
+ENSEMBLE_SEEDS = [7, 42, 202]
+y_pred_ens = mean(preds)
+Ensemble sering meningkatkan performa dibanding single model.
+
+Model 2: Hybrid Residual (LSTM Ensemble + XGBoost)
+Ide Utama
+Hybrid residual memecah prediksi jadi dua tahap:
+
+LSTM ensemble memprediksi target utama
+yhat_lstm
+
+Hitung residual (selisih target dan prediksi LSTM)
+residual = y_true - yhat_lstm
+
+XGBoost memprediksi residual dari fitur tabular
+residual_hat
+
+Prediksi akhir
+yhat_final = yhat_lstm + residual_hat
+
+Kenapa ini efektif?
+
+LSTM: kuat menangkap dependensi waktu dan pola musiman.
+
+XGBoost: kuat untuk koreksi non-linear berbasis fitur lag/rolling yang kaya.
+
+Alignment (Penting!)
+Karena pembuatan sekuens menghilangkan LOOKBACK baris awal, data untuk XGBoost harus disejajarkan:
+
+python
+Salin kode
+y_train_al = yl_train[LOOKBACK:]
+X_train_al = Xx_train[LOOKBACK:]
+Tanpa alignment, residual akan salah pasangan antara X dan y.
+
+Peak Weighting untuk Residual
+Agar XGB lebih fokus pada kondisi ekstrem, digunakan threshold quantile (P90):
+
+thr = quantile(y_train_al, 0.90)
+
+Jika y > thr, sample weight diperbesar.
+
+python
+Salin kode
+w_train = np.where(y_train_al > thr, 1.0 + K, 1.0)
+Metrik Evaluasi
+Evaluasi menggunakan:
+
+MAE: rata-rata absolute error
+
+RMSE: error kuadrat (lebih sensitif terhadap outlier)
+
+R²: goodness-of-fit (mendekati 1 lebih baik)
+
+Implementasi:
+
+python
+Salin kode
+mae = mean_absolute_error(y_true, y_hat)
+rmse = sqrt(mean_squared_error(y_true, y_hat))
+r2 = r2_score(y_true, y_hat)
+Hasil Eksperimen
+Eksperimen LSTM (Awal)
+Single model (weighted huber):
+
+MAE: 0.0170
+
+RMSE: 0.0231
+
+R²: 0.3436
+
+Ensemble (3 model):
+
+MAE: 0.0157
+
+RMSE: 0.0216
+
+R²: 0.4251
+
+Eksperimen Feature Engineering Lanjut + Hybrid Residual
+LSTM ensemble (test aligned):
+
+MAE: 0.0047
+
+RMSE: 0.0062
+
+R²: 0.9522
+
+Hybrid residual (LSTM + XGB):
+
+MAE: 0.0040
+
+RMSE: 0.0053
+
+R²: 0.9652
+
+Peak-only (test > P90 train)
+LSTM peak-only:
+
+R²: 0.4183
+
+Hybrid peak-only:
+
+R²: 0.6198
+
+Kesimpulan:
+
+Hybrid residual meningkatkan akurasi keseluruhan
+
+Perbaikan signifikan pada prediksi kondisi ekstrem (peak)
+
+Cara Menjalankan
+1) Instalasi Library
+Pastikan environment memiliki:
+
+numpy
+
+pandas
+
+scikit-learn
+
+tensorflow
+
+xgboost
+
+Contoh:
+
+bash
+Salin kode
+pip install numpy pandas scikit-learn tensorflow xgboost
+2) Siapkan Dataset
+Letakkan dataset di path yang sesuai, lalu ubah:
+
+python
+Salin kode
+CSV_PATH = "path/ke/pekanbaru_clean_final.csv"
+3) Jalankan Script/Notebook
+Jalankan bagian training LSTM
+
+(Opsional) jalankan ensemble
+
+Jalankan hybrid residual untuk performa terbaik
+
+Struktur File yang Disarankan
+Agar repo rapi:
+
+text
+Salin kode
+.
+├── data/
+│   └── pekanbaru_clean_final.csv
+├── notebooks/
+│   └── rainfall_forecasting.ipynb
+├── src/
+│   ├── train_lstm.py
+│   ├── train_hybrid.py
+│   └── utils.py
+├── README.md
+└── requirements.txt
+Konfigurasi / Hyperparameter
+Parameter utama:
+
+LOOKBACK = 120
+
+LR = 8e-4
+
+DROPOUT = 0.05
+
+EPOCHS = 200
+
+BATCH_SIZE = 32
+
+Weighted loss:
+
+LOSS_MODE = weighted_huber
+
+WEIGHT_K = 6.0
+
+HUBER_DELTA = 0.02
+
+Ensemble seeds:
+
+[7, 42, 202]
+
+Catatan Penting
+Time series split harus kronologis, jangan shuffle.
+
+Rolling feature harus hati-hati agar tidak leakage (pakai shift(1)).
+
+Ensemble membantu stabilitas, tapi performa terbaik dicapai dengan hybrid residual.
+
+Peak prediction memang sulit, sehingga dipakai weighted loss + peak weighting.
+
+Lisensi
+Tambahkan lisensi sesuai kebutuhan, misalnya:
+
+MIT License
+
+Apache 2.0
+
+yaml
+Salin kode
+
+---
+
+Kalau kamu mau, aku bisa:
+- bikinin **requirements.txt** dari library yang kamu pakai,
+- atau pecah README jadi lebih “GitHub ready” (badge, hasil dalam tabel, contoh command run `python src/train_hybrid.py`, dll),
+- atau bantu bikin “Model Card” (penjelasan risiko, batasan, interpretasi).
